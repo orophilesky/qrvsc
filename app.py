@@ -1,0 +1,420 @@
+#!/usr/bin/env python3
+"""Flask check-in service for EventPass."""
+
+import csv
+import io
+import os
+import sqlite3
+import threading
+import time
+from collections import defaultdict, deque
+from datetime import datetime, timezone
+from functools import wraps
+
+from flask import Flask, Response, jsonify, render_template_string, request
+
+
+SCANNER_PAGE = r"""<!doctype html>
+<html lang="en">
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+  <meta name="theme-color" content="#101827">
+  <title>EventPass Gate Scanner</title>
+  <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+  <style>
+    *{box-sizing:border-box}body{margin:0;background:#101827;color:#f8fafc;font:16px system-ui,sans-serif}
+    main{max-width:620px;margin:auto;padding:18px}h1{font-size:1.55rem;margin:4px 0 16px}
+    label{display:block;color:#b8c5d8;font-size:.88rem;margin:12px 0 5px}
+    input,button{width:100%;padding:13px;border:1px solid #536176;border-radius:9px;font:inherit}
+    input{background:#1b2638;color:#fff}button{background:#2563eb;color:#fff;border:0;font-weight:700;margin-top:12px}
+    #counter{background:#1b2638;text-align:center;border-radius:10px;padding:13px;margin:16px 0;font-weight:700}
+    #reader{width:100%;border:0!important;border-radius:12px;overflow:hidden;background:#fff}
+    #reader video{object-fit:cover}#manual{display:flex;gap:8px}#manual input{min-width:0}
+    #manual button{width:110px;margin:0}#status{color:#b8c5d8;margin-top:10px;font-size:.9rem}
+    #overlay{display:none;position:fixed;inset:0;z-index:5;align-items:center;justify-content:center;text-align:center;padding:24px;color:#fff;font-size:clamp(2rem,10vw,4rem);font-weight:850}
+    #overlay small{display:block;font-size:1.2rem;margin-top:15px;overflow-wrap:anywhere}
+  </style>
+</head>
+<body><main>
+  <h1>EventPass Gate Scanner</h1>
+  <label for="gate">Gate name</label><input id="gate" autocomplete="off" placeholder="Gate A">
+  <label for="pin">Staff PIN</label><input id="pin" inputmode="numeric" type="password" autocomplete="off" placeholder="Staff PIN">
+  <div id="counter">Entered -- / -- | Remaining --</div>
+  <div id="reader"></div>
+  <label for="manualCode">Manual fallback</label>
+  <div id="manual"><input id="manualCode" maxlength="12" autocomplete="off" placeholder="12-character code"><button id="submitCode">Scan code</button></div>
+  <div id="status">Allow camera access to scan.</div>
+</main><div id="overlay"></div>
+<script>
+(() => {
+  const gate = document.getElementById('gate'), pin = document.getElementById('pin');
+  const overlay = document.getElementById('overlay'), status = document.getElementById('status');
+  const seen = new Map(); let showing = false, scanner = null;
+  const color = {OK:'#15803d', USED:'#b91c1c', INVALID:'#b91c1c', ERROR:'#c2410c'};
+  function tone(ok) {
+    try { const audio = new (window.AudioContext || window.webkitAudioContext)();
+      const oscillator = audio.createOscillator(), gain = audio.createGain();
+      oscillator.frequency.value = ok ? 880 : 220; gain.gain.value = .08;
+      oscillator.connect(gain); gain.connect(audio.destination); oscillator.start();
+      oscillator.stop(audio.currentTime + (ok ? .12 : .3)); oscillator.onended = () => audio.close();
+    } catch (_) {}
+    if (navigator.vibrate) navigator.vibrate(ok ? [100,50,100] : [300]);
+  }
+  async function stats() {
+    try { const response = await fetch('/api/stats'); if (!response.ok) return;
+      const data = await response.json();
+      document.getElementById('counter').textContent =
+        `Entered ${data.entered} / ${data.total} | Remaining ${data.remaining}`;
+    } catch (_) {}
+  }
+  async function scan(raw) {
+    const code = raw.trim().toUpperCase(), now = Date.now();
+    if (showing || !code || (seen.has(code) && now - seen.get(code) < 3000)) return;
+    seen.set(code, now); showing = true;
+    if (seen.size > 200) for (const [key, stamp] of seen) if (now - stamp >= 3000) seen.delete(key);
+    try {
+      const response = await fetch('/api/scan', {method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({code, gate:gate.value.trim(), pin:pin.value})});
+      if (response.status === 401) throw new Error('PIN');
+      if (!response.ok) throw new Error('NETWORK');
+      const data = await response.json(); let message, success = false;
+      if (data.status === 'OK') {message = `ENTRY OK<small>Pass ${data.serial}</small>`;success = true;}
+      else if (data.status === 'USED') message = `ALREADY USED<small>${data.used_at || ''} · ${data.gate || 'Unknown gate'}</small>`;
+      else message = 'INVALID PASS';
+      overlay.innerHTML = message; overlay.style.background = color[data.status] || color.INVALID;
+      status.textContent = data.status === 'OK' ? `Checked in: ${data.serial}` : data.status;
+      tone(success); await stats();
+    } catch (error) {
+      overlay.textContent = error.message === 'PIN' ? 'WRONG STAFF PIN' : 'NETWORK ERROR, scan again';
+      overlay.style.background = color.ERROR; tone(false);
+    }
+    overlay.style.display = 'flex';
+    setTimeout(() => {overlay.style.display='none';showing=false;}, 2000);
+  }
+  document.getElementById('submitCode').addEventListener('click', () => {
+    const input = document.getElementById('manualCode'); scan(input.value); input.value = '';
+  });
+  document.getElementById('manualCode').addEventListener('keydown', e => {
+    if (e.key === 'Enter') {e.preventDefault();document.getElementById('submitCode').click();}
+  });
+  if (window.Html5Qrcode) {
+    scanner = new Html5Qrcode('reader');
+    scanner.start({facingMode:'environment'}, {fps:10,qrbox:{width:250,height:250}},
+      text => scan(text), () => {}).then(() => status.textContent = 'Camera ready.')
+      .catch(() => status.textContent = 'Camera unavailable. Use manual fallback or HTTPS.');
+  } else status.textContent = 'Scanner library unavailable. Use manual fallback.';
+  stats(); setInterval(stats, 15000);
+})();
+</script></body></html>"""
+
+
+ADMIN_PAGE = r"""<!doctype html>
+<html lang="en"><head><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>EventPass Admin</title><style>
+body{font:15px system-ui,sans-serif;max-width:1100px;margin:24px auto;padding:0 16px;color:#172033}
+input,button{padding:9px;margin:4px;border:1px solid #aaa;border-radius:5px}button{cursor:pointer}
+table{border-collapse:collapse;width:100%;margin:12px 0}td,th{border:1px solid #ddd;padding:7px;text-align:left}
+th{background:#f1f5f9}.scroll{overflow:auto}#message{font-weight:bold}
+</style></head><body>
+<h1>EventPass Admin</h1><label>Admin PIN <input id="pin" type="password" autocomplete="off"></label>
+<button id="refresh">Load live report</button><button id="export">Export CSV</button>
+<p id="message">Enter admin PIN to view reports.</p><div id="stats"></div><h2>Per-gate counts</h2><div id="gates"></div>
+<h2>Search pass by code or serial</h2><input id="query" placeholder="Code or serial"><button id="search">Search</button>
+<div id="searchResult"></div><h2>Recent scans (last 50)</h2><div class="scroll"><table><thead><tr>
+<th>Time</th><th>Code</th><th>Result</th><th>Gate</th><th>Serial</th></tr></thead><tbody id="scans"></tbody></table></div>
+<script>
+const pin=()=>document.getElementById('pin').value;
+async function post(url,body={}){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},
+body:JSON.stringify({...body,pin:pin()})});const d=await r.json();if(!r.ok)throw Error(d.error||'Request failed');return d;}
+async function refresh(){try{const d=await post('/admin/api/data');document.getElementById('message').textContent='Updated.';
+document.getElementById('stats').textContent=`Total ${d.total} | Entered ${d.entered} | Remaining ${d.remaining}`;
+document.getElementById('gates').textContent=d.gates.map(x=>`${x.gate||'(no gate)'}: ${x.count}`).join(' · ');
+document.getElementById('scans').innerHTML=d.scans.map(x=>`<tr><td>${escapeHtml(x.ts)}</td><td>${escapeHtml(x.code)}</td>
+<td>${escapeHtml(x.result)}</td><td>${escapeHtml(x.gate||'')}</td><td>${x.serial||''}</td></tr>`).join('');
+}catch(e){document.getElementById('message').textContent=e.message;}}
+function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+document.getElementById('refresh').onclick=refresh;
+document.getElementById('search').onclick=async()=>{try{const d=await post('/admin/api/search',{query:document.getElementById('query').value});
+const p=d.pass;if(!p){document.getElementById('searchResult').textContent='No matching pass.';return;}
+const box=document.getElementById('searchResult');box.textContent=`Serial ${p.serial} · ${p.code} · ${p.used?'USED':'UNUSED'} · ${p.gate||''} · Revoked ${!!p.revoked} `;
+if(p.used){const b=document.createElement('button');b.textContent='Undo entry';b.onclick=()=>action('undo',p.code);box.appendChild(b);}
+if(!p.revoked){const b=document.createElement('button');b.textContent='Revoke pass';b.onclick=()=>action('revoke',p.code);box.appendChild(b);}
+}catch(e){document.getElementById('message').textContent=e.message;}};
+async function action(action,code){if(!confirm(`${action} pass ${code}?`))return;try{await post('/admin/api/action',{action,code});await refresh();
+document.getElementById('search').click();}catch(e){document.getElementById('message').textContent=e.message;}}
+document.getElementById('export').onclick=async()=>{try{const r=await fetch('/admin/export.csv',{headers:{'X-Admin-Pin':pin()}});
+if(!r.ok)throw Error('Export denied');const url=URL.createObjectURL(await r.blob()),a=document.createElement('a');
+a.href=url;a.download='eventpass_checkins.csv';a.click();URL.revokeObjectURL(url);}catch(e){document.getElementById('message').textContent=e.message;}};
+setInterval(()=>{if(pin())refresh();},15000);
+</script></body></html>"""
+
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def get_connection(db_path):
+    connection = sqlite3.connect(db_path, timeout=10)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA busy_timeout=10000")
+    return connection
+
+
+def init_db(db_path):
+    with get_connection(db_path) as connection:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS passes (
+                serial INTEGER PRIMARY KEY,
+                code TEXT UNIQUE NOT NULL,
+                used INTEGER DEFAULT 0,
+                used_at TEXT,
+                gate TEXT,
+                revoked INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS scan_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                code TEXT NOT NULL,
+                result TEXT NOT NULL,
+                gate TEXT
+            );
+            CREATE TABLE IF NOT EXISTS admin_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                action TEXT NOT NULL,
+                code TEXT NOT NULL,
+                detail TEXT
+            );
+            CREATE INDEX IF NOT EXISTS scan_log_ts_idx ON scan_log(ts);
+            CREATE INDEX IF NOT EXISTS scan_log_gate_idx ON scan_log(gate);
+            """
+        )
+
+
+class ScanRateLimiter:
+    def __init__(self, limit=10, period=1.0):
+        self.limit = limit
+        self.period = period
+        self.requests = defaultdict(deque)
+        self.lock = threading.Lock()
+
+    def allow(self, ip, now=None):
+        now = time.monotonic() if now is None else now
+        with self.lock:
+            bucket = self.requests[ip]
+            while bucket and now - bucket[0] >= self.period:
+                bucket.popleft()
+            if len(bucket) >= self.limit:
+                return False
+            bucket.append(now)
+            return True
+
+
+def create_app(config=None):
+    app = Flask(__name__)
+    app.config.update(
+        DB_PATH=os.environ.get("DB_PATH", "passes.db"),
+        STAFF_PIN=os.environ.get("STAFF_PIN", ""),
+        ADMIN_PIN=os.environ.get("ADMIN_PIN", ""),
+    )
+    if config:
+        app.config.update(config)
+    limiter = ScanRateLimiter(limit=30)
+
+    def db():
+        return get_connection(app.config["DB_PATH"])
+
+    def authorized_admin():
+        payload = request.get_json(silent=True) or {}
+        return (
+            bool(app.config["ADMIN_PIN"])
+            and (request.headers.get("X-Admin-Pin") or payload.get("pin"))
+            == app.config["ADMIN_PIN"]
+        )
+
+    def admin_required(function):
+        @wraps(function)
+        def wrapped(*args, **kwargs):
+            if not authorized_admin():
+                return jsonify(error="Unauthorized"), 401
+            return function(*args, **kwargs)
+
+        return wrapped
+
+    @app.get("/")
+    def scanner():
+        return render_template_string(SCANNER_PAGE)
+
+    @app.get("/api/stats")
+    def stats():
+        with db() as connection:
+            total = connection.execute("SELECT COUNT(*) FROM passes").fetchone()[0]
+            entered = connection.execute(
+                "SELECT COUNT(*) FROM passes WHERE used=1 AND revoked=0"
+            ).fetchone()[0]
+        return jsonify(total=total, entered=entered, remaining=total - entered)
+
+    @app.post("/api/scan")
+    def scan():
+        if not app.testing and not limiter.allow(request.remote_addr or "unknown"):
+            return jsonify(error="Too many scans; retry shortly"), 429
+        payload = request.get_json(silent=True) or {}
+        code = str(payload.get("code") or "").strip().upper()
+        gate = str(payload.get("gate") or "").strip()[:100]
+        pin = payload.get("pin")
+        if not app.config["STAFF_PIN"] or pin != app.config["STAFF_PIN"]:
+            with db() as connection:
+                connection.execute(
+                    "INSERT INTO scan_log(ts,code,result,gate) VALUES (?,?,?,?)",
+                    (utc_now(), code, "UNAUTHORIZED", gate),
+                )
+            return jsonify(error="Wrong staff PIN"), 401
+        now = utc_now()
+        with db() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """UPDATE passes SET used=1, used_at=?, gate=?
+                   WHERE code=? AND used=0 AND revoked=0""",
+                (now, gate, code),
+            )
+            if cursor.rowcount == 1:
+                row = connection.execute(
+                    "SELECT serial FROM passes WHERE code=?", (code,)
+                ).fetchone()
+                result = {"status": "OK", "serial": row["serial"]}
+                log_result = "OK"
+            else:
+                row = connection.execute(
+                    "SELECT serial,used,used_at,gate,revoked FROM passes WHERE code=?",
+                    (code,),
+                ).fetchone()
+                if row is None or row["revoked"]:
+                    result = {"status": "INVALID"}
+                    log_result = "INVALID"
+                else:
+                    result = {
+                        "status": "USED",
+                        "serial": row["serial"],
+                        "used_at": row["used_at"],
+                        "gate": row["gate"],
+                    }
+                    log_result = "USED"
+            connection.execute(
+                "INSERT INTO scan_log(ts,code,result,gate) VALUES (?,?,?,?)",
+                (now, code, log_result, gate),
+            )
+        return jsonify(result)
+
+    @app.get("/admin")
+    def admin_page():
+        return render_template_string(ADMIN_PAGE)
+
+    @app.post("/admin/api/data")
+    @admin_required
+    def admin_data():
+        with db() as connection:
+            total = connection.execute("SELECT COUNT(*) FROM passes").fetchone()[0]
+            entered = connection.execute(
+                "SELECT COUNT(*) FROM passes WHERE used=1 AND revoked=0"
+            ).fetchone()[0]
+            gates = connection.execute(
+                """SELECT gate,COUNT(*) AS count FROM passes
+                   WHERE used=1 AND revoked=0 GROUP BY gate ORDER BY gate"""
+            ).fetchall()
+            scans = connection.execute(
+                """SELECT s.ts,s.code,s.result,s.gate,p.serial FROM scan_log s
+                   LEFT JOIN passes p ON p.code=s.code ORDER BY s.id DESC LIMIT 50"""
+            ).fetchall()
+        return jsonify(
+            total=total,
+            entered=entered,
+            remaining=total - entered,
+            gates=[dict(row) for row in gates],
+            scans=[dict(row) for row in scans],
+        )
+
+    @app.post("/admin/api/search")
+    @admin_required
+    def admin_search():
+        payload = request.get_json(silent=True) or {}
+        query = str(payload.get("query") or "").strip()
+        with db() as connection:
+            if query.isdigit():
+                row = connection.execute(
+                    "SELECT serial,code,used,used_at,gate,revoked FROM passes WHERE serial=?",
+                    (int(query),),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    "SELECT serial,code,used,used_at,gate,revoked FROM passes WHERE code=?",
+                    (query.upper(),),
+                ).fetchone()
+        return jsonify({"pass": dict(row) if row else None})
+
+    @app.post("/admin/api/action")
+    @admin_required
+    def admin_action():
+        payload = request.get_json(silent=True) or {}
+        action = payload.get("action")
+        code = str(payload.get("code") or "").strip().upper()
+        if action not in ("revoke", "undo") or not code:
+            return jsonify(error="Expected action revoke/undo and a pass code"), 400
+        with db() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            pass_row = connection.execute(
+                "SELECT serial,revoked FROM passes WHERE code=?", (code,)
+            ).fetchone()
+            if pass_row is None:
+                return jsonify(error="Pass not found"), 404
+            if action == "revoke":
+                connection.execute("UPDATE passes SET revoked=1 WHERE code=?", (code,))
+                detail = "Pass revoked"
+            else:
+                connection.execute(
+                    "UPDATE passes SET used=0,used_at=NULL,gate=NULL WHERE code=?",
+                    (code,),
+                )
+                detail = "Entry undone"
+            connection.execute(
+                "INSERT INTO admin_audit(ts,action,code,detail) VALUES (?,?,?,?)",
+                (utc_now(), action.upper(), code, detail),
+            )
+        return jsonify(status="OK", action=action, serial=pass_row["serial"])
+
+    @app.get("/admin/export.csv")
+    def admin_export():
+        if not authorized_admin():
+            return jsonify(error="Unauthorized"), 401
+        output = io.StringIO(newline="")
+        writer = csv.writer(output)
+        writer.writerow(("serial", "code", "used", "used_at", "gate"))
+        with db() as connection:
+            rows = connection.execute(
+                "SELECT serial,code,used,used_at,gate FROM passes ORDER BY serial"
+            )
+            writer.writerows(tuple(row) for row in rows)
+        return Response(
+            output.getvalue(),
+            mimetype="text/csv",
+            headers={"Content-Disposition": "attachment; filename=eventpass_checkins.csv"},
+        )
+
+    return app
+
+
+app = create_app()
+
+
+if __name__ == "__main__":
+    if not app.config["STAFF_PIN"] or not app.config["ADMIN_PIN"]:
+        raise SystemExit("Set STAFF_PIN and ADMIN_PIN before starting EventPass.")
+    init_db(app.config["DB_PATH"])
+    port = int(os.environ.get("PORT", "5000"))
+    try:
+        from waitress import serve
+
+        serve(app, host="0.0.0.0", port=port, threads=16)
+    except ImportError:
+        app.run(host="0.0.0.0", port=port, threaded=True)

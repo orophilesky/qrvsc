@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+passes.db
+passes.db-shm
+passes.db-wal
+eventpass.zip
