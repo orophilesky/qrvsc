@@ -38,34 +38,76 @@ SCANNER_PAGE = r"""<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-  <meta name="theme-color" content="#101827">
+  <meta name="theme-color" content="#E0E5EC">
   <title>EventPass Gate Scanner</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&family=Plus+Jakarta+Sans:wght@500;600;700;800&display=swap" rel="stylesheet">
   <style>
-    *{box-sizing:border-box}body{margin:0;background:#101827;color:#f8fafc;font:16px system-ui,sans-serif}
-    main{max-width:620px;margin:auto;padding:18px}h1{font-size:1.55rem;margin:4px 0 16px}
-    label{display:block;color:#b8c5d8;font-size:.88rem;margin:12px 0 5px}
-    input,button{width:100%;padding:13px;border:1px solid #536176;border-radius:9px;font:inherit}
-    input{background:#1b2638;color:#fff}button{background:#2563eb;color:#fff;border:0;font-weight:700;margin-top:12px}
-    #counter{background:#1b2638;text-align:center;border-radius:10px;padding:13px;margin:16px 0;font-weight:700}
-    #reader{width:100%;aspect-ratio:4/3;max-height:70vh;border:0!important;border-radius:12px;overflow:hidden;background:#000;position:relative}
-    #reader video,#reader canvas.qr-canvas{position:absolute;inset:0;width:100%!important;height:100%!important;object-fit:cover;display:block}
-    #reader img{object-fit:cover}
-    #reader>div{width:100%!important;max-width:100%!important}
-    #manual{display:flex;gap:8px}#manual input{min-width:0}
-    #manual button{width:110px;margin:0}#status{color:#b8c5d8;margin-top:10px;font-size:.9rem}
-    #overlay{display:none;position:fixed;inset:0;z-index:5;align-items:center;justify-content:center;text-align:center;padding:24px;color:#fff;font-size:clamp(2rem,10vw,4rem);font-weight:850}
-    #overlay small{display:block;font-size:1.2rem;margin-top:15px;overflow-wrap:anywhere}
+    :root{
+      --bg:#E0E5EC; --fg:#3D4852; --muted:#6B7280; --accent:#6C63FF; --accent-light:#8B84FF; --accent-secondary:#38B2AC;
+      --shadow-light:rgba(255,255,255,0.5); --shadow-dark:rgb(163,177,198,0.6);
+      --shadow-dark-strong:rgb(163,177,198,0.7); --shadow-light-strong:rgba(255,255,255,0.6);
+      --ex:9px 9px 16px var(--shadow-dark), -9px -9px 16px var(--shadow-light);
+      --ex-hover:12px 12px 20px var(--shadow-dark-strong), -12px -12px 20px var(--shadow-light-strong);
+      --ex-sm:5px 5px 10px var(--shadow-dark), -5px -5px 10px var(--shadow-light);
+      --in:inset 6px 6px 10px var(--shadow-dark), inset -6px -6px 10px var(--shadow-light);
+      --in-deep:inset 10px 10px 20px var(--shadow-dark-strong), inset -10px -10px 20px var(--shadow-light-strong);
+      --in-sm:inset 3px 3px 6px var(--shadow-dark), inset -3px -3px 6px var(--shadow-light);
+    }
+    *{box-sizing:border-box}
+    html{scroll-behavior:smooth}
+    body{margin:0;min-height:100vh;background:var(--bg);color:var(--fg);font:400 16px "DM Sans",system-ui,sans-serif;line-height:1.5}
+    main{max-width:720px;margin:0 auto;padding:32px 20px 40px}
+    h1{margin:0 0 24px;font:800 clamp(1.9rem,5vw,2.6rem)/1.1 "Plus Jakarta Sans","DM Sans",sans-serif;letter-spacing:-0.02em;color:var(--fg)}
+    .card{background:var(--bg);border-radius:32px;padding:24px;box-shadow:var(--ex)}
+    .stack{display:grid;gap:18px}
+    .field label{display:block;color:var(--muted);font-size:.9rem;font-weight:500;margin:0 0 8px 4px}
+    input,button{width:100%;font:inherit;border:0;border-radius:16px;transition:all 300ms ease-out;min-height:48px}
+    input{padding:14px 16px;background:var(--bg);color:var(--fg);box-shadow:var(--in)}
+    input::placeholder{color:#A0AEC0}
+    input:focus{outline:none;box-shadow:var(--in-deep),0 0 0 2px var(--bg),0 0 0 4px var(--accent)}
+    button{padding:14px 18px;cursor:pointer;font-weight:700;background:var(--bg);color:var(--fg);box-shadow:var(--ex)}
+    button:hover{transform:translateY(-1px);box-shadow:var(--ex-hover)}
+    button:active{transform:translateY(0.5px);box-shadow:var(--in-sm)}
+    button:focus{outline:none;box-shadow:var(--ex),0 0 0 2px var(--bg),0 0 0 4px var(--accent)}
+    #submitCode{background:var(--accent);color:#fff;box-shadow:9px 9px 16px rgba(108,99,255,0.35), -9px -9px 16px var(--shadow-light)}
+    #submitCode:hover{box-shadow:12px 12px 20px rgba(108,99,255,0.42), -12px -12px 20px var(--shadow-light-strong)}
+    #submitCode:active{box-shadow:inset 4px 4px 8px rgba(74,66,214,0.45), inset -4px -4px 8px rgba(139,132,255,0.35)}
+    #submitCode:focus{box-shadow:9px 9px 16px rgba(108,99,255,0.35), -9px -9px 16px var(--shadow-light),0 0 0 2px var(--bg),0 0 0 4px var(--accent-light)}
+    #counter{background:var(--bg);color:var(--fg);text-align:center;border-radius:16px;padding:16px 18px;font-weight:700;box-shadow:var(--ex-sm)}
+    #reader{width:100%;aspect-ratio:4/3;max-height:70vh;border:0!important;border-radius:32px;overflow:hidden;background:var(--bg);position:relative;box-shadow:var(--in-deep);padding:10px}
+    #reader video,#reader canvas.qr-canvas{position:absolute;inset:10px;width:calc(100% - 20px)!important;height:calc(100% - 20px)!important;object-fit:cover;display:block;border-radius:24px;background:#111827}
+    #reader img{object-fit:cover;border-radius:24px}
+    #reader>div{width:100%!important;max-width:100%!important;border-radius:24px;overflow:hidden}
+    #manual{display:flex;gap:12px;align-items:stretch}
+    #manual input{min-width:0;flex:1}
+    #manual button{width:auto;min-width:132px;margin:0;flex:0 0 auto}
+    #status{color:var(--muted);margin-top:4px;font-size:.95rem;padding:0 4px}
+    #overlay{display:none;position:fixed;inset:0;z-index:5;align-items:center;justify-content:center;text-align:center;padding:24px;color:#fff;font:800 clamp(2rem,10vw,4rem)/1.05 "Plus Jakarta Sans","DM Sans",sans-serif;letter-spacing:-0.02em}
+    #overlay small{display:block;font:500 1.15rem "DM Sans",sans-serif;margin-top:16px;overflow-wrap:anywhere;letter-spacing:normal}
+    @media (max-width:640px){
+      main{padding:20px 14px 28px}
+      .card{padding:18px;border-radius:28px}
+      #reader{border-radius:28px;padding:8px}
+      #reader video,#reader canvas.qr-canvas{inset:8px;width:calc(100% - 16px)!important;height:calc(100% - 16px)!important;border-radius:20px}
+      #manual{flex-direction:column}
+      #manual button{width:100%}
+    }
   </style>
 </head>
 <body><main>
   <h1>EventPass Gate Scanner</h1>
-  <label for="gate">Gate name</label><input id="gate" autocomplete="off" placeholder="Gate A">
-  <label for="pin">Staff PIN</label><input id="pin" inputmode="numeric" type="password" autocomplete="off" placeholder="Staff PIN">
-  <div id="counter">Entered -- / -- | Remaining --</div>
-  <div id="reader"></div>
-  <label for="manualCode">Manual fallback</label>
-  <div id="manual"><input id="manualCode" maxlength="12" autocomplete="off" placeholder="12-character code"><button id="submitCode">Scan code</button></div>
-  <div id="status">Allow camera access to scan.</div>
+  <div class="card stack">
+    <div class="field"><label for="gate">Gate name</label><input id="gate" autocomplete="off" placeholder="Gate A"></div>
+    <div class="field"><label for="pin">Staff PIN</label><input id="pin" inputmode="numeric" type="password" autocomplete="off" placeholder="Staff PIN"></div>
+    <div id="counter">Entered -- / -- | Remaining --</div>
+    <div id="reader"></div>
+    <div class="field"><label for="manualCode">Manual fallback</label>
+      <div id="manual"><input id="manualCode" maxlength="12" autocomplete="off" placeholder="12-character code"><button id="submitCode" type="button">Scan code</button></div>
+    </div>
+    <div id="status">Allow camera access to scan.</div>
+  </div>
 </main><div id="overlay"></div>
 <script>
 (() => {
@@ -149,7 +191,7 @@ SCANNER_PAGE = r"""<!doctype html>
       if (!data || !data.status) throw new Error('Invalid server response');
       let message, success = false;
       if (data.status === 'OK') {message = `ENTRY OK<small>Pass ${data.serial}</small>`;success = true;}
-      else if (data.status === 'USED') message = `ALREADY USED<small>${data.used_at || ''} · ${data.gate || 'Unknown gate'}</small>`;
+      else if (data.status === 'USED') message = `ALREADY USED<small>${data.used_at || ''} ? ${data.gate || 'Unknown gate'}</small>`;
       else message = 'INVALID PASS';
       overlay.innerHTML = message; overlay.style.background = color[data.status] || color.INVALID;
       status.textContent = data.status === 'OK' ? `Checked in: ${data.serial}` : data.status;
@@ -169,6 +211,7 @@ SCANNER_PAGE = r"""<!doctype html>
       else startScanner().catch(() => {});
     }, 2000);
   }
+
   function loadHtml5Qrcode() {
     if (window.Html5Qrcode) return Promise.resolve();
     if (fallback.scriptPromise) return fallback.scriptPromise;
@@ -306,28 +349,67 @@ SCANNER_PAGE = r"""<!doctype html>
 })();
 </script></body></html>"""
 
-
 ADMIN_PAGE = r"""<!doctype html>
-<html lang="en"><head><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>EventPass Admin</title><style>
-body{font:15px system-ui,sans-serif;max-width:1100px;margin:24px auto;padding:0 16px;color:#172033}
-input,button{padding:9px;margin:4px;border:1px solid #aaa;border-radius:5px}button{cursor:pointer}
-table{border-collapse:collapse;width:100%;margin:12px 0}td,th{border:1px solid #ddd;padding:7px;text-align:left}
-th{background:#f1f5f9}.scroll{overflow:auto}#message{font-weight:bold}
-</style></head><body>
-<h1>EventPass Admin</h1><label>Admin PIN <input id="pin" type="password" autocomplete="off"></label>
-<button id="refresh">Load live report</button><button id="export">Export CSV</button>
-<p id="message">Enter admin PIN to view reports.</p><div id="stats"></div><h2>Per-gate counts</h2><div id="gates"></div>
-<h2>Search pass by code or serial</h2><input id="query" placeholder="Code or serial"><button id="search">Search</button>
-<div id="searchResult"></div><h2>Recent scans (last 50)</h2><div class="scroll"><table><thead><tr>
-<th>Time</th><th>Code</th><th>Result</th><th>Gate</th><th>Serial</th></tr></thead><tbody id="scans"></tbody></table></div>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#E0E5EC">
+<title>EventPass Admin</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&family=Plus+Jakarta+Sans:wght@500;600;700;800&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#E0E5EC;--fg:#3D4852;--muted:#6B7280;--accent:#6C63FF;--accent-light:#8B84FF;--shadow-light:rgba(255,255,255,0.5);--shadow-dark:rgb(163,177,198,0.6);--shadow-dark-strong:rgb(163,177,198,0.7);--shadow-light-strong:rgba(255,255,255,0.6);--ex:9px 9px 16px var(--shadow-dark),-9px -9px 16px var(--shadow-light);--ex-hover:12px 12px 20px var(--shadow-dark-strong),-12px -12px 20px var(--shadow-light-strong);--ex-sm:5px 5px 10px var(--shadow-dark),-5px -5px 10px var(--shadow-light);--in:inset 6px 6px 10px var(--shadow-dark),inset -6px -6px 10px var(--shadow-light);--in-deep:inset 10px 10px 20px var(--shadow-dark-strong),inset -10px -10px 20px var(--shadow-light-strong);--in-sm:inset 3px 3px 6px var(--shadow-dark),inset -3px -3px 6px var(--shadow-light)}
+*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--bg);color:var(--fg);font:400 15px "DM Sans",system-ui,sans-serif;line-height:1.5}
+main{max-width:1100px;margin:0 auto;padding:32px 20px 40px}
+h1{margin:0 0 20px;font:800 clamp(2rem,4vw,2.8rem)/1.1 "Plus Jakarta Sans","DM Sans",sans-serif;letter-spacing:-.02em}
+h2{margin:0 0 12px;font:700 1.2rem "Plus Jakarta Sans","DM Sans",sans-serif;letter-spacing:-.01em}
+.card{background:var(--bg);border-radius:32px;padding:24px;box-shadow:var(--ex);margin:18px 0}
+.controls,.search-row{display:flex;flex-wrap:wrap;gap:12px;align-items:center}
+label{color:var(--muted);font-weight:500}
+input,button{font:inherit;border:0;border-radius:16px;min-height:48px;transition:all 300ms ease-out}
+input{padding:12px 14px;background:var(--bg);color:var(--fg);box-shadow:var(--in)}
+input:focus{outline:none;box-shadow:var(--in-deep),0 0 0 2px var(--bg),0 0 0 4px var(--accent)}
+button{padding:12px 16px;cursor:pointer;font-weight:700;background:var(--bg);color:var(--fg);box-shadow:var(--ex-sm)}
+button:hover{transform:translateY(-1px);box-shadow:var(--ex)}
+button:active{transform:translateY(.5px);box-shadow:var(--in-sm)}
+button:focus{outline:none;box-shadow:var(--ex-sm),0 0 0 2px var(--bg),0 0 0 4px var(--accent)}
+#refresh,#search{background:var(--accent);color:#fff;box-shadow:9px 9px 16px rgba(108,99,255,.35),-9px -9px 16px var(--shadow-light)}
+#refresh:hover,#search:hover{box-shadow:12px 12px 20px rgba(108,99,255,.42),-12px -12px 20px var(--shadow-light-strong)}
+#refresh:active,#search:active{box-shadow:inset 4px 4px 8px rgba(74,66,214,.45),inset -4px -4px 8px rgba(139,132,255,.35)}
+#message{font-weight:700;margin:0;color:var(--fg)}
+#stats,#gates,#searchResult{color:var(--fg)}
+#searchResult{margin-top:12px}
+#searchResult button{margin:8px 8px 0 0}
+.scroll{overflow:auto;border-radius:24px;padding:8px;box-shadow:var(--in-deep);background:var(--bg)}
+table{border-collapse:separate;border-spacing:0;width:100%;min-width:640px}
+td,th{padding:12px 10px;text-align:left;border-bottom:1px solid rgb(163,177,198,.35)}
+th{background:transparent;color:var(--muted);font-weight:700;position:sticky;top:0}
+tr:last-child td{border-bottom:0}
+@media (max-width:720px){main{padding:20px 14px 28px}.card{padding:18px;border-radius:28px}.controls,.search-row{flex-direction:column;align-items:stretch}.controls label{width:100%}.controls input,.search-row input,.controls button,.search-row button{width:100%}}
+</style></head><body><main>
+<h1>EventPass Admin</h1>
+<div class="card controls">
+  <label for="pin">Admin PIN</label>
+  <input id="pin" type="password" autocomplete="off" placeholder="Admin PIN">
+  <button id="refresh">Load live report</button>
+  <button id="export">Export CSV</button>
+</div>
+<div class="card"><p id="message">Enter admin PIN to view reports.</p><div id="stats"></div></div>
+<div class="card"><h2>Per-gate counts</h2><div id="gates"></div></div>
+<div class="card"><h2>Search pass by code or serial</h2>
+  <div class="search-row"><input id="query" placeholder="Code or serial"><button id="search">Search</button></div>
+  <div id="searchResult"></div>
+</div>
+<div class="card"><h2>Recent scans (last 50)</h2><div class="scroll"><table><thead><tr>
+<th>Time</th><th>Code</th><th>Result</th><th>Gate</th><th>Serial</th></tr></thead><tbody id="scans"></tbody></table></div></div>
+</main>
 <script>
 const pin=()=>document.getElementById('pin').value;
 async function post(url,body={}){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},
 body:JSON.stringify({...body,pin:pin()})});const d=await r.json();if(!r.ok)throw Error(d.error||'Request failed');return d;}
 async function refresh(){try{const d=await post('/admin/api/data');document.getElementById('message').textContent='Updated.';
 document.getElementById('stats').textContent=`Total ${d.total} | Entered ${d.entered} | Remaining ${d.remaining}`;
-document.getElementById('gates').textContent=d.gates.map(x=>`${x.gate||'(no gate)'}: ${x.count}`).join(' · ');
+document.getElementById('gates').textContent=d.gates.map(x=>`${x.gate||'(no gate)'}: ${x.count}`).join(' ? ');
 document.getElementById('scans').innerHTML=d.scans.map(x=>`<tr><td>${escapeHtml(x.ts)}</td><td>${escapeHtml(x.code)}</td>
 <td>${escapeHtml(x.result)}</td><td>${escapeHtml(x.gate||'')}</td><td>${x.serial||''}</td></tr>`).join('');
 }catch(e){document.getElementById('message').textContent=e.message;}}
@@ -335,7 +417,7 @@ function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':
 document.getElementById('refresh').onclick=refresh;
 document.getElementById('search').onclick=async()=>{try{const d=await post('/admin/api/search',{query:document.getElementById('query').value});
 const p=d.pass;if(!p){document.getElementById('searchResult').textContent='No matching pass.';return;}
-const box=document.getElementById('searchResult');box.textContent=`Serial ${p.serial} · ${p.code} · ${p.used?'USED':'UNUSED'} · ${p.gate||''} · Revoked ${!!p.revoked} `;
+const box=document.getElementById('searchResult');box.textContent=`Serial ${p.serial} ? ${p.code} ? ${p.used?'USED':'UNUSED'} ? ${p.gate||''} ? Revoked ${!!p.revoked} `;
 if(p.used){const b=document.createElement('button');b.textContent='Undo entry';b.onclick=()=>action('undo',p.code);box.appendChild(b);}
 if(!p.revoked){const b=document.createElement('button');b.textContent='Revoke pass';b.onclick=()=>action('revoke',p.code);box.appendChild(b);}
 }catch(e){document.getElementById('message').textContent=e.message;}};
