@@ -49,8 +49,8 @@ Maintain a secure backup of `passes.db`; it is the live source of pass state.
 Set two different PINs, then start the threaded Waitress server:
 
 ```powershell
-$env:STAFF_PIN = "2619"
-$env:ADMIN_PIN = "5100"
+$env:STAFF_PIN = "1717"
+$env:ADMIN_PIN = "1704"
 $env:PORT = "5000"
 $env:DB_PATH = ".\passes.db"
 python app.py
