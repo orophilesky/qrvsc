@@ -4,6 +4,7 @@
 import csv
 import io
 import os
+import shutil
 import sqlite3
 import threading
 import time
@@ -63,8 +64,10 @@ SCANNER_PAGE = r"""<!doctype html>
   async function stats() {
     try { const response = await fetch('/api/stats'); if (!response.ok) return;
       const data = await response.json();
-      document.getElementById('counter').textContent =
-        `Entered ${data.entered} / ${data.total} | Remaining ${data.remaining}`;
+      if (typeof data.entered === 'number') {
+        document.getElementById('counter').textContent =
+          `Entered ${data.entered} / ${data.total} | Remaining ${data.remaining}`;
+      }
     } catch (_) {}
   }
   async function scan(raw) {
@@ -75,9 +78,14 @@ SCANNER_PAGE = r"""<!doctype html>
     try {
       const response = await fetch('/api/scan', {method:'POST', headers:{'Content-Type':'application/json'},
         body:JSON.stringify({code, gate:gate.value.trim(), pin:pin.value})});
-      if (response.status === 401) throw new Error('PIN');
-      if (!response.ok) throw new Error('NETWORK');
-      const data = await response.json(); let message, success = false;
+      let data = null;
+      try { data = await response.json(); } catch (_) {}
+      if (!response.ok) {
+        const message = (data && data.error) ? data.error : (response.status === 401 ? 'Wrong staff PIN' : `Request failed (${response.status})`);
+        throw new Error(message);
+      }
+      if (!data || !data.status) throw new Error('Invalid server response');
+      let message, success = false;
       if (data.status === 'OK') {message = `ENTRY OK<small>Pass ${data.serial}</small>`;success = true;}
       else if (data.status === 'USED') message = `ALREADY USED<small>${data.used_at || ''} · ${data.gate || 'Unknown gate'}</small>`;
       else message = 'INVALID PASS';
@@ -85,8 +93,10 @@ SCANNER_PAGE = r"""<!doctype html>
       status.textContent = data.status === 'OK' ? `Checked in: ${data.serial}` : data.status;
       tone(success); await stats();
     } catch (error) {
-      overlay.textContent = error.message === 'PIN' ? 'WRONG STAFF PIN' : 'NETWORK ERROR, scan again';
+      const text = (error && error.name === 'TypeError') ? 'NETWORK ERROR, scan again' : (error.message || 'Scan failed');
+      overlay.textContent = text;
       overlay.style.background = color.ERROR; tone(false);
+      status.textContent = text;
     }
     overlay.style.display = 'flex';
     setTimeout(() => {overlay.style.display='none';showing=false;}, 2000);
@@ -212,10 +222,31 @@ class ScanRateLimiter:
             return True
 
 
+def _prepare_db_path(db_path):
+    path = str(db_path)
+    if not os.environ.get("VERCEL"):
+        return path
+    source = path
+    if not os.path.isabs(source):
+        source = os.path.abspath(source)
+    target = os.path.join("/tmp", os.path.basename(source) or "passes.db")
+    try:
+        if os.path.exists(source) and not os.path.exists(target):
+            shutil.copy2(source, target)
+            for suffix in ("-wal", "-shm"):
+                sidecar = source + suffix
+                if os.path.exists(sidecar):
+                    shutil.copy2(sidecar, target + suffix)
+    except OSError:
+        pass
+    return target
+
+
 def create_app(config=None):
     app = Flask(__name__)
+    configured_db_path = os.environ.get("DB_PATH", "passes.db")
     app.config.update(
-        DB_PATH=os.environ.get("DB_PATH", "passes.db"),
+        DB_PATH=_prepare_db_path(configured_db_path),
         STAFF_PIN=os.environ.get("STAFF_PIN", ""),
         ADMIN_PIN=os.environ.get("ADMIN_PIN", ""),
     )
@@ -223,8 +254,22 @@ def create_app(config=None):
         app.config.update(config)
     limiter = ScanRateLimiter(limit=30)
 
+    try:
+        init_db(app.config["DB_PATH"])
+    except Exception:
+        if not app.config.get("TESTING"):
+            app.logger.exception("Database initialization failed")
+
     def db():
         return get_connection(app.config["DB_PATH"])
+
+    def json_db_error(exc):
+        message = str(exc)
+        if "readonly" in message.lower() or "read-only" in message.lower():
+            return jsonify(error="Database is read-only on this deployment. Use a persistent host or an external database."), 500
+        if "no such table" in message.lower():
+            return jsonify(error="Database is not initialized on this deployment."), 500
+        return jsonify(error=f"Database error: {message}"), 500
 
     def authorized_admin():
         payload = request.get_json(silent=True) or {}
@@ -249,11 +294,14 @@ def create_app(config=None):
 
     @app.get("/api/stats")
     def stats():
-        with db() as connection:
-            total = connection.execute("SELECT COUNT(*) FROM passes").fetchone()[0]
-            entered = connection.execute(
-                "SELECT COUNT(*) FROM passes WHERE used=1 AND revoked=0"
-            ).fetchone()[0]
+        try:
+            with db() as connection:
+                total = connection.execute("SELECT COUNT(*) FROM passes").fetchone()[0]
+                entered = connection.execute(
+                    "SELECT COUNT(*) FROM passes WHERE used=1 AND revoked=0"
+                ).fetchone()[0]
+        except sqlite3.Error as exc:
+            return json_db_error(exc)
         return jsonify(total=total, entered=entered, remaining=total - entered)
 
     @app.post("/api/scan")
@@ -265,46 +313,52 @@ def create_app(config=None):
         gate = str(payload.get("gate") or "").strip()[:100]
         pin = payload.get("pin")
         if not app.config["STAFF_PIN"] or pin != app.config["STAFF_PIN"]:
-            with db() as connection:
-                connection.execute(
-                    "INSERT INTO scan_log(ts,code,result,gate) VALUES (?,?,?,?)",
-                    (utc_now(), code, "UNAUTHORIZED", gate),
-                )
+            try:
+                with db() as connection:
+                    connection.execute(
+                        "INSERT INTO scan_log(ts,code,result,gate) VALUES (?,?,?,?)",
+                        (utc_now(), code, "UNAUTHORIZED", gate),
+                    )
+            except sqlite3.Error:
+                pass
             return jsonify(error="Wrong staff PIN"), 401
         now = utc_now()
-        with db() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            cursor = connection.execute(
-                """UPDATE passes SET used=1, used_at=?, gate=?
-                   WHERE code=? AND used=0 AND revoked=0""",
-                (now, gate, code),
-            )
-            if cursor.rowcount == 1:
-                row = connection.execute(
-                    "SELECT serial FROM passes WHERE code=?", (code,)
-                ).fetchone()
-                result = {"status": "OK", "serial": row["serial"]}
-                log_result = "OK"
-            else:
-                row = connection.execute(
-                    "SELECT serial,used,used_at,gate,revoked FROM passes WHERE code=?",
-                    (code,),
-                ).fetchone()
-                if row is None or row["revoked"]:
-                    result = {"status": "INVALID"}
-                    log_result = "INVALID"
+        try:
+            with db() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                cursor = connection.execute(
+                    """UPDATE passes SET used=1, used_at=?, gate=?
+                       WHERE code=? AND used=0 AND revoked=0""",
+                    (now, gate, code),
+                )
+                if cursor.rowcount == 1:
+                    row = connection.execute(
+                        "SELECT serial FROM passes WHERE code=?", (code,)
+                    ).fetchone()
+                    result = {"status": "OK", "serial": row["serial"]}
+                    log_result = "OK"
                 else:
-                    result = {
-                        "status": "USED",
-                        "serial": row["serial"],
-                        "used_at": row["used_at"],
-                        "gate": row["gate"],
-                    }
-                    log_result = "USED"
-            connection.execute(
-                "INSERT INTO scan_log(ts,code,result,gate) VALUES (?,?,?,?)",
-                (now, code, log_result, gate),
-            )
+                    row = connection.execute(
+                        "SELECT serial,used,used_at,gate,revoked FROM passes WHERE code=?",
+                        (code,),
+                    ).fetchone()
+                    if row is None or row["revoked"]:
+                        result = {"status": "INVALID"}
+                        log_result = "INVALID"
+                    else:
+                        result = {
+                            "status": "USED",
+                            "serial": row["serial"],
+                            "used_at": row["used_at"],
+                            "gate": row["gate"],
+                        }
+                        log_result = "USED"
+                connection.execute(
+                    "INSERT INTO scan_log(ts,code,result,gate) VALUES (?,?,?,?)",
+                    (now, code, log_result, gate),
+                )
+        except sqlite3.Error as exc:
+            return json_db_error(exc)
         return jsonify(result)
 
     @app.get("/admin")
@@ -314,19 +368,22 @@ def create_app(config=None):
     @app.post("/admin/api/data")
     @admin_required
     def admin_data():
-        with db() as connection:
-            total = connection.execute("SELECT COUNT(*) FROM passes").fetchone()[0]
-            entered = connection.execute(
-                "SELECT COUNT(*) FROM passes WHERE used=1 AND revoked=0"
-            ).fetchone()[0]
-            gates = connection.execute(
-                """SELECT gate,COUNT(*) AS count FROM passes
-                   WHERE used=1 AND revoked=0 GROUP BY gate ORDER BY gate"""
-            ).fetchall()
-            scans = connection.execute(
-                """SELECT s.ts,s.code,s.result,s.gate,p.serial FROM scan_log s
-                   LEFT JOIN passes p ON p.code=s.code ORDER BY s.id DESC LIMIT 50"""
-            ).fetchall()
+        try:
+            with db() as connection:
+                total = connection.execute("SELECT COUNT(*) FROM passes").fetchone()[0]
+                entered = connection.execute(
+                    "SELECT COUNT(*) FROM passes WHERE used=1 AND revoked=0"
+                ).fetchone()[0]
+                gates = connection.execute(
+                    """SELECT gate,COUNT(*) AS count FROM passes
+                       WHERE used=1 AND revoked=0 GROUP BY gate ORDER BY gate"""
+                ).fetchall()
+                scans = connection.execute(
+                    """SELECT s.ts,s.code,s.result,s.gate,p.serial FROM scan_log s
+                       LEFT JOIN passes p ON p.code=s.code ORDER BY s.id DESC LIMIT 50"""
+                ).fetchall()
+        except sqlite3.Error as exc:
+            return json_db_error(exc)
         return jsonify(
             total=total,
             entered=entered,
