@@ -5,3 +5,5 @@ __pycache__/
 *.db-wal
 eventpass.zip
 codes.csv
+.env
+start.ps1
