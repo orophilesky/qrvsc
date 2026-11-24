@@ -128,8 +128,14 @@ SCANNER_PAGE = r"""<!doctype html>
     if (showing || !code || (seen.has(code) && now - seen.get(code) < 3000)) return;
     seen.set(code, now); showing = true;
     if (seen.size > 200) for (const [key, stamp] of seen) if (now - stamp >= 3000) seen.delete(key);
-    // stop camera/scan loop immediately on detection to save CPU/battery
+    // immediate feedback: avoid black screen and show progress while API responds
     const mode = activeMode;
+    try { if (navigator.vibrate) navigator.vibrate(40); } catch (_) {}
+    overlay.textContent = 'CHECKING...';
+    overlay.style.background = '#334155';
+    overlay.style.display = 'flex';
+    status.textContent = `Checking ${code}...`;
+    // stop camera/scan loop immediately on detection to save CPU/battery
     await stopScanning();
     try {
       const response = await fetch('/api/scan', {method:'POST', headers:{'Content-Type':'application/json'},
@@ -147,7 +153,7 @@ SCANNER_PAGE = r"""<!doctype html>
       else message = 'INVALID PASS';
       overlay.innerHTML = message; overlay.style.background = color[data.status] || color.INVALID;
       status.textContent = data.status === 'OK' ? `Checked in: ${data.serial}` : data.status;
-      tone(success); await stats();
+      tone(success); stats().catch(() => {});
     } catch (error) {
       const text = (error && error.name === 'TypeError') ? 'NETWORK ERROR, scan again' : (error.message || 'Scan failed');
       overlay.textContent = text;
@@ -160,9 +166,9 @@ SCANNER_PAGE = r"""<!doctype html>
       // resume camera for next scan
       if (mode === 'native') startNative().catch(() => startFallback());
       else if (mode === 'fallback') startFallback().catch(() => {});
+      else startScanner().catch(() => {});
     }, 2000);
   }
-
   function loadHtml5Qrcode() {
     if (window.Html5Qrcode) return Promise.resolve();
     if (fallback.scriptPromise) return fallback.scriptPromise;
