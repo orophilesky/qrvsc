@@ -47,9 +47,10 @@ SCANNER_PAGE = r"""<!doctype html>
     input,button{width:100%;padding:13px;border:1px solid #536176;border-radius:9px;font:inherit}
     input{background:#1b2638;color:#fff}button{background:#2563eb;color:#fff;border:0;font-weight:700;margin-top:12px}
     #counter{background:#1b2638;text-align:center;border-radius:10px;padding:13px;margin:16px 0;font-weight:700}
-    #reader{width:100%;border:0!important;border-radius:12px;overflow:hidden;background:#000;min-height:240px;position:relative}
-    #reader video{width:100%;height:100%;object-fit:cover;display:block}
-    #reader canvas{display:none}
+    #reader{width:100%;aspect-ratio:4/3;max-height:70vh;border:0!important;border-radius:12px;overflow:hidden;background:#000;position:relative}
+    #reader video,#reader canvas.qr-canvas{position:absolute;inset:0;width:100%!important;height:100%!important;object-fit:cover;display:block}
+    #reader img{object-fit:cover}
+    #reader>div{width:100%!important;max-width:100%!important}
     #manual{display:flex;gap:8px}#manual input{min-width:0}
     #manual button{width:110px;margin:0}#status{color:#b8c5d8;margin-top:10px;font-size:.9rem}
     #overlay{display:none;position:fixed;inset:0;z-index:5;align-items:center;justify-content:center;text-align:center;padding:24px;color:#fff;font-size:clamp(2rem,10vw,4rem);font-weight:850}
@@ -219,6 +220,8 @@ SCANNER_PAGE = r"""<!doctype html>
     reader.innerHTML = '';
     const video = document.createElement('video');
     video.setAttribute('playsinline', '');
+    video.setAttribute('webkit-playsinline', '');
+    video.playsInline = true;
     video.muted = true;
     video.autoplay = true;
     reader.appendChild(video);
