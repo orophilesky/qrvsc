@@ -6,13 +6,31 @@ import io
 import os
 import shutil
 import sqlite3
+import ssl
 import threading
 import time
+import urllib.parse
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 from functools import wraps
 
 from flask import Flask, Response, jsonify, render_template_string, request
+
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+
+    _PG_DRIVER = "psycopg"
+except Exception:  # pragma: no cover - fallback for environments without psycopg
+    psycopg = None
+    dict_row = None
+    try:
+        import pg8000.dbapi as pg8000_dbapi
+
+        _PG_DRIVER = "pg8000"
+    except Exception:  # pragma: no cover
+        pg8000_dbapi = None
+        _PG_DRIVER = None
 
 
 SCANNER_PAGE = r"""<!doctype html>
@@ -158,20 +176,256 @@ a.href=url;a.download='eventpass_checkins.csv';a.click();URL.revokeObjectURL(url
 setInterval(()=>{if(pin())refresh();},15000);
 </script></body></html>"""
 
+class DbRow:
+    def __init__(self, data):
+        if isinstance(data, dict):
+            self._data = dict(data)
+            self._values = tuple(data.values())
+        elif isinstance(data, DbRow):
+            self._data = dict(data._data)
+            self._values = tuple(data._values)
+        else:
+            seq = tuple(data)
+            self._data = {}
+            self._values = seq
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self._values[key]
+        return self._data[key]
+
+    def keys(self):
+        return self._data.keys()
+
+    def items(self):
+        return self._data.items()
+
+    def values(self):
+        return self._data.values()
+
+    def get(self, key, default=None):
+        return self._data.get(key, default)
+
+    def __iter__(self):
+        return iter(self._values)
+
+    def __len__(self):
+        return len(self._values)
+
+
+class CursorWrapper:
+    def __init__(self, cursor, use_postgres=False):
+        self._cursor = cursor
+        self._use_postgres = use_postgres
+
+    @property
+    def rowcount(self):
+        return getattr(self._cursor, "rowcount", -1)
+
+    @property
+    def description(self):
+        return self._cursor.description
+
+    def _wrap(self, row):
+        if row is None:
+            return None
+        if isinstance(row, DbRow):
+            return row
+        if isinstance(row, dict):
+            return DbRow(row)
+        desc = self._cursor.description
+        if desc:
+            data = {d[0]: row[i] for i, d in enumerate(desc)}
+            return DbRow(data)
+        return DbRow(row)
+
+    def fetchone(self):
+        return self._wrap(self._cursor.fetchone())
+
+    def fetchall(self):
+        return [self._wrap(r) for r in self._cursor.fetchall()]
+
+    def __iter__(self):
+        for row in self._cursor:
+            yield self._wrap(row)
+
+    def close(self):
+        try:
+            self._cursor.close()
+        except Exception:
+            pass
+
+
+class DBConnection:
+    def __init__(self, conn, use_postgres=False):
+        self._conn = conn
+        self._use_postgres = use_postgres
+
+    def _adapt_sql(self, sql):
+        if self._use_postgres:
+            if sql.strip().upper() == "BEGIN IMMEDIATE":
+                return None
+            return sql.replace("?", "%s")
+        return sql
+
+    def execute(self, sql, params=None):
+        sql = self._adapt_sql(sql)
+        if sql is None:
+            return CursorWrapper(self._conn.cursor(), self._use_postgres)
+        cur = self._conn.cursor()
+        if params is None:
+            cur.execute(sql)
+        else:
+            cur.execute(sql, params)
+        return CursorWrapper(cur, self._use_postgres)
+
+    def executescript(self, script):
+        if self._use_postgres:
+            cur = self._conn.cursor()
+            try:
+                cur.execute(script)
+            finally:
+                cur.close()
+            return
+        return self._conn.executescript(script)
+
+    def commit(self):
+        self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
+
+    def close(self):
+        self._conn.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if exc_type:
+                self._conn.rollback()
+            else:
+                self._conn.commit()
+        finally:
+            self._conn.close()
+        return False
+
 
 def utc_now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def get_connection(db_path):
+def _database_url():
+    return (
+        os.environ.get("SUPABASE_DB_URL")
+        or os.environ.get("DATABASE_URL")
+        or os.environ.get("SUPABASE_POSTGRES_URL")
+    )
+
+
+def _connect_postgres(url):
+    if _PG_DRIVER == "psycopg":
+        return psycopg.connect(url, row_factory=dict_row)
+    if _PG_DRIVER == "pg8000":
+        parsed = urllib.parse.urlparse(url)
+        query = urllib.parse.parse_qs(parsed.query)
+        sslmode = (query.get("sslmode", ["require"])[0] or "require").lower()
+        ssl_context = None
+        if sslmode not in ("disable", "allow"):
+            ssl_context = ssl.create_default_context()
+            if os.environ.get("SUPABASE_DB_SSL_INSECURE") == "1":
+                ssl_context.check_hostname = False
+                ssl_context.verify_mode = ssl.CERT_NONE
+        kwargs = dict(
+            user=urllib.parse.unquote(parsed.username or ""),
+            password=urllib.parse.unquote(parsed.password or ""),
+            host=parsed.hostname,
+            port=parsed.port or 5432,
+            database=(parsed.path or "/postgres").lstrip("/") or "postgres",
+            ssl_context=ssl_context,
+        )
+        try:
+            return pg8000_dbapi.connect(**kwargs)
+        except ssl.SSLCertVerificationError:
+            if ssl_context is None or os.environ.get("SUPABASE_DB_SSL_INSECURE") == "1":
+                raise
+            insecure = ssl.create_default_context()
+            insecure.check_hostname = False
+            insecure.verify_mode = ssl.CERT_NONE
+            return pg8000_dbapi.connect(**{**kwargs, "ssl_context": insecure})
+    raise RuntimeError("No Postgres driver available. Install pg8000 or psycopg[binary].")
+
+
+def get_sqlite_connection(db_path):
     connection = sqlite3.connect(db_path, timeout=10)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA busy_timeout=10000")
     return connection
 
 
-def init_db(db_path):
-    with get_connection(db_path) as connection:
+POSTGRES_SCHEMA_STATEMENTS = [
+    """
+    CREATE TABLE IF NOT EXISTS passes (
+        serial BIGSERIAL PRIMARY KEY,
+        code TEXT UNIQUE NOT NULL,
+        used INTEGER NOT NULL DEFAULT 0,
+        used_at TEXT,
+        gate TEXT,
+        revoked INTEGER NOT NULL DEFAULT 0
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS scan_log (
+        id BIGSERIAL PRIMARY KEY,
+        ts TEXT NOT NULL,
+        code TEXT NOT NULL,
+        result TEXT NOT NULL,
+        gate TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS admin_audit (
+        id BIGSERIAL PRIMARY KEY,
+        ts TEXT NOT NULL,
+        action TEXT NOT NULL,
+        code TEXT NOT NULL,
+        detail TEXT
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS scan_log_ts_idx ON scan_log(ts)",
+    "CREATE INDEX IF NOT EXISTS scan_log_gate_idx ON scan_log(gate)",
+]
+
+
+def init_db(db_path=None, use_postgres=False, database_url=None):
+    if use_postgres:
+        conn = _connect_postgres(database_url or _database_url())
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='passes'
+                ORDER BY ordinal_position
+                """
+            )
+            rows = cur.fetchall()
+            cols = [r.get("column_name") if isinstance(r, dict) else r[0] for r in rows] if rows else []
+            expected = ["serial", "code", "used", "used_at", "gate", "revoked"]
+            if cols and cols != expected:
+                cur.execute("DROP TABLE IF EXISTS passes")
+            for stmt in POSTGRES_SCHEMA_STATEMENTS:
+                cur.execute(stmt)
+            conn.commit()
+        finally:
+            try:
+                cur.close()
+            finally:
+                conn.close()
+        return
+    with get_sqlite_connection(db_path) as connection:
         connection.execute("PRAGMA journal_mode=WAL")
         connection.executescript(
             """
@@ -245,29 +499,41 @@ def _prepare_db_path(db_path):
 def create_app(config=None):
     app = Flask(__name__)
     configured_db_path = os.environ.get("DB_PATH", "passes.db")
+    database_url = _database_url()
+    use_postgres = bool(database_url) or bool(config and config.get("USE_POSTGRES"))
     app.config.update(
         DB_PATH=_prepare_db_path(configured_db_path),
+        DATABASE_URL=database_url,
+        USE_POSTGRES=use_postgres,
         STAFF_PIN=os.environ.get("STAFF_PIN", ""),
         ADMIN_PIN=os.environ.get("ADMIN_PIN", ""),
     )
     if config:
         app.config.update(config)
+        if "USE_POSTGRES" in config:
+            use_postgres = bool(config["USE_POSTGRES"])
+            app.config["USE_POSTGRES"] = use_postgres
+        if config.get("DATABASE_URL"):
+            app.config["DATABASE_URL"] = config["DATABASE_URL"]
     limiter = ScanRateLimiter(limit=30)
 
     try:
-        init_db(app.config["DB_PATH"])
+        init_db(app.config["DB_PATH"], use_postgres=app.config["USE_POSTGRES"], database_url=app.config.get("DATABASE_URL"))
     except Exception:
         if not app.config.get("TESTING"):
             app.logger.exception("Database initialization failed")
 
     def db():
-        return get_connection(app.config["DB_PATH"])
+        if app.config["USE_POSTGRES"]:
+            return DBConnection(_connect_postgres(app.config.get("DATABASE_URL") or _database_url()), use_postgres=True)
+        return DBConnection(get_sqlite_connection(app.config["DB_PATH"]), use_postgres=False)
 
     def json_db_error(exc):
         message = str(exc)
-        if "readonly" in message.lower() or "read-only" in message.lower():
+        low = message.lower()
+        if "readonly" in low or "read-only" in low:
             return jsonify(error="Database is read-only on this deployment. Use a persistent host or an external database."), 500
-        if "no such table" in message.lower():
+        if "no such table" in low or "undefinedtable" in low or ("relation" in low and "does not exist" in low):
             return jsonify(error="Database is not initialized on this deployment."), 500
         return jsonify(error=f"Database error: {message}"), 500
 
@@ -301,9 +567,9 @@ def create_app(config=None):
                 entered = connection.execute(
                     "SELECT COUNT(*) FROM passes WHERE used=1 AND revoked=0"
                 ).fetchone()[0]
-        except sqlite3.Error as exc:
+        except Exception as exc:
             return json_db_error(exc)
-        return jsonify(total=total, entered=entered, remaining=total - entered)
+        return jsonify(total=int(total or 0), entered=int(entered or 0), remaining=int((total or 0) - (entered or 0)))
 
     @app.post("/api/scan")
     def scan():
@@ -322,45 +588,72 @@ def create_app(config=None):
                         "INSERT INTO scan_log(ts,code,result,gate) VALUES (?,?,?,?)",
                         (utc_now(), code, "UNAUTHORIZED", gate),
                     )
-            except sqlite3.Error:
+            except Exception:
                 pass
             return jsonify(error="Wrong staff PIN"), 401
         now = utc_now()
         try:
             with db() as connection:
-                connection.execute("BEGIN IMMEDIATE")
-                cursor = connection.execute(
-                    """UPDATE passes SET used=1, used_at=?, gate=?
-                       WHERE code=? AND used=0 AND revoked=0""",
-                    (now, gate, code),
-                )
-                if cursor.rowcount == 1:
-                    row = connection.execute(
-                        "SELECT serial FROM passes WHERE code=?", (code,)
+                if app.config["USE_POSTGRES"]:
+                    claimed = connection.execute(
+                        """UPDATE passes SET used=1, used_at=?, gate=?
+                           WHERE code=? AND used=0 AND revoked=0
+                           RETURNING serial""",
+                        (now, gate, code),
                     ).fetchone()
-                    result = {"status": "OK", "serial": row["serial"]}
-                    log_result = "OK"
-                else:
-                    row = connection.execute(
-                        "SELECT serial,used,used_at,gate,revoked FROM passes WHERE code=?",
-                        (code,),
-                    ).fetchone()
-                    if row is None or row["revoked"]:
-                        result = {"status": "INVALID"}
-                        log_result = "INVALID"
+                    if claimed is not None:
+                        result = {"status": "OK", "serial": int(claimed["serial"])}
+                        log_result = "OK"
                     else:
-                        result = {
-                            "status": "USED",
-                            "serial": row["serial"],
-                            "used_at": row["used_at"],
-                            "gate": row["gate"],
-                        }
-                        log_result = "USED"
+                        row = connection.execute(
+                            "SELECT serial,used,used_at,gate,revoked FROM passes WHERE code=?",
+                            (code,),
+                        ).fetchone()
+                        if row is None or row["revoked"]:
+                            result = {"status": "INVALID"}
+                            log_result = "INVALID"
+                        else:
+                            result = {
+                                "status": "USED",
+                                "serial": int(row["serial"]),
+                                "used_at": row["used_at"],
+                                "gate": row["gate"],
+                            }
+                            log_result = "USED"
+                else:
+                    connection.execute("BEGIN IMMEDIATE")
+                    cursor = connection.execute(
+                        """UPDATE passes SET used=1, used_at=?, gate=?
+                           WHERE code=? AND used=0 AND revoked=0""",
+                        (now, gate, code),
+                    )
+                    if cursor.rowcount == 1:
+                        row = connection.execute(
+                            "SELECT serial FROM passes WHERE code=?", (code,)
+                        ).fetchone()
+                        result = {"status": "OK", "serial": row["serial"]}
+                        log_result = "OK"
+                    else:
+                        row = connection.execute(
+                            "SELECT serial,used,used_at,gate,revoked FROM passes WHERE code=?",
+                            (code,),
+                        ).fetchone()
+                        if row is None or row["revoked"]:
+                            result = {"status": "INVALID"}
+                            log_result = "INVALID"
+                        else:
+                            result = {
+                                "status": "USED",
+                                "serial": row["serial"],
+                                "used_at": row["used_at"],
+                                "gate": row["gate"],
+                            }
+                            log_result = "USED"
                 connection.execute(
                     "INSERT INTO scan_log(ts,code,result,gate) VALUES (?,?,?,?)",
                     (now, code, log_result, gate),
                 )
-        except sqlite3.Error as exc:
+        except Exception as exc:
             return json_db_error(exc)
         return jsonify(result)
 
@@ -385,12 +678,12 @@ def create_app(config=None):
                     """SELECT s.ts,s.code,s.result,s.gate,p.serial FROM scan_log s
                        LEFT JOIN passes p ON p.code=s.code ORDER BY s.id DESC LIMIT 50"""
                 ).fetchall()
-        except sqlite3.Error as exc:
+        except Exception as exc:
             return json_db_error(exc)
         return jsonify(
-            total=total,
-            entered=entered,
-            remaining=total - entered,
+            total=int(total or 0),
+            entered=int(entered or 0),
+            remaining=int((total or 0) - (entered or 0)),
             gates=[dict(row) for row in gates],
             scans=[dict(row) for row in scans],
         )
@@ -400,17 +693,20 @@ def create_app(config=None):
     def admin_search():
         payload = request.get_json(silent=True) or {}
         query = str(payload.get("query") or "").strip()
-        with db() as connection:
-            if query.isdigit():
-                row = connection.execute(
-                    "SELECT serial,code,used,used_at,gate,revoked FROM passes WHERE serial=?",
-                    (int(query),),
-                ).fetchone()
-            else:
-                row = connection.execute(
-                    "SELECT serial,code,used,used_at,gate,revoked FROM passes WHERE code=?",
-                    (query.upper(),),
-                ).fetchone()
+        try:
+            with db() as connection:
+                if query.isdigit():
+                    row = connection.execute(
+                        "SELECT serial,code,used,used_at,gate,revoked FROM passes WHERE serial=?",
+                        (int(query),),
+                    ).fetchone()
+                else:
+                    row = connection.execute(
+                        "SELECT serial,code,used,used_at,gate,revoked FROM passes WHERE code=?",
+                        (query.upper(),),
+                    ).fetchone()
+        except Exception as exc:
+            return json_db_error(exc)
         return jsonify({"pass": dict(row) if row else None})
 
     @app.post("/admin/api/action")
@@ -421,27 +717,41 @@ def create_app(config=None):
         code = str(payload.get("code") or "").strip().upper()
         if action not in ("revoke", "undo") or not code:
             return jsonify(error="Expected action revoke/undo and a pass code"), 400
-        with db() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            pass_row = connection.execute(
-                "SELECT serial,revoked FROM passes WHERE code=?", (code,)
-            ).fetchone()
-            if pass_row is None:
-                return jsonify(error="Pass not found"), 404
-            if action == "revoke":
-                connection.execute("UPDATE passes SET revoked=1 WHERE code=?", (code,))
-                detail = "Pass revoked"
-            else:
+        try:
+            with db() as connection:
+                if app.config["USE_POSTGRES"]:
+                    pass_row = connection.execute(
+                        "SELECT serial,revoked FROM passes WHERE code=? FOR UPDATE",
+                        (code,),
+                    ).fetchone()
+                else:
+                    connection.execute("BEGIN IMMEDIATE")
+                    pass_row = connection.execute(
+                        "SELECT serial,revoked FROM passes WHERE code=?", (code,)
+                    ).fetchone()
+                if pass_row is None:
+                    return jsonify(error="Pass not found"), 404
+                if action == "revoke":
+                    connection.execute("UPDATE passes SET revoked=1 WHERE code=?", (code,))
+                    detail = "Pass revoked"
+                else:
+                    connection.execute(
+                        "UPDATE passes SET used=0,used_at=NULL,gate=NULL WHERE code=?",
+                        (code,),
+                    )
+                    detail = "Entry undone"
                 connection.execute(
-                    "UPDATE passes SET used=0,used_at=NULL,gate=NULL WHERE code=?",
-                    (code,),
+                    "INSERT INTO admin_audit(ts,action,code,detail) VALUES (?,?,?,?)",
+                    (utc_now(), action.upper(), code, detail),
                 )
-                detail = "Entry undone"
-            connection.execute(
-                "INSERT INTO admin_audit(ts,action,code,detail) VALUES (?,?,?,?)",
-                (utc_now(), action.upper(), code, detail),
-            )
-        return jsonify(status="OK", action=action, serial=pass_row["serial"])
+        except Exception as exc:
+            return json_db_error(exc)
+        serial = pass_row["serial"]
+        try:
+            serial = int(serial)
+        except Exception:
+            pass
+        return jsonify(status="OK", action=action, serial=serial)
 
     @app.get("/admin/export.csv")
     def admin_export():
@@ -450,11 +760,14 @@ def create_app(config=None):
         output = io.StringIO(newline="")
         writer = csv.writer(output)
         writer.writerow(("serial", "code", "used", "used_at", "gate"))
-        with db() as connection:
-            rows = connection.execute(
-                "SELECT serial,code,used,used_at,gate FROM passes ORDER BY serial"
-            )
-            writer.writerows(tuple(row) for row in rows)
+        try:
+            with db() as connection:
+                rows = connection.execute(
+                    "SELECT serial,code,used,used_at,gate FROM passes ORDER BY serial"
+                )
+                writer.writerows(tuple(row) for row in rows)
+        except Exception as exc:
+            return json_db_error(exc)
         return Response(
             output.getvalue(),
             mimetype="text/csv",
@@ -470,7 +783,7 @@ app = create_app()
 if __name__ == "__main__":
     if not str(app.config["STAFF_PIN"]).strip() or not str(app.config["ADMIN_PIN"]).strip():
         raise SystemExit("Set STAFF_PIN and ADMIN_PIN before starting EventPass.")
-    init_db(app.config["DB_PATH"])
+    init_db(app.config["DB_PATH"], use_postgres=app.config.get("USE_POSTGRES", False), database_url=app.config.get("DATABASE_URL"))
     port = int(os.environ.get("PORT", "5000"))
     try:
         from waitress import serve
