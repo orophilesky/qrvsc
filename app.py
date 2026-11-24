@@ -273,11 +273,12 @@ def create_app(config=None):
 
     def authorized_admin():
         payload = request.get_json(silent=True) or {}
-        return (
-            bool(app.config["ADMIN_PIN"])
-            and (request.headers.get("X-Admin-Pin") or payload.get("pin"))
-            == app.config["ADMIN_PIN"]
-        )
+        provided = request.headers.get("X-Admin-Pin")
+        if provided is None:
+            provided = payload.get("pin")
+        provided_pin = "" if provided is None else str(provided).strip()
+        admin_pin = str(app.config["ADMIN_PIN"] or "").strip()
+        return bool(admin_pin) and provided_pin == admin_pin
 
     def admin_required(function):
         @wraps(function)
@@ -312,7 +313,9 @@ def create_app(config=None):
         code = str(payload.get("code") or "").strip().upper()
         gate = str(payload.get("gate") or "").strip()[:100]
         pin = payload.get("pin")
-        if not app.config["STAFF_PIN"] or pin != app.config["STAFF_PIN"]:
+        provided_pin = "" if pin is None else str(pin).strip()
+        staff_pin = str(app.config["STAFF_PIN"] or "").strip()
+        if not staff_pin or provided_pin != staff_pin:
             try:
                 with db() as connection:
                     connection.execute(
@@ -465,7 +468,7 @@ app = create_app()
 
 
 if __name__ == "__main__":
-    if not app.config["STAFF_PIN"] or not app.config["ADMIN_PIN"]:
+    if not str(app.config["STAFF_PIN"]).strip() or not str(app.config["ADMIN_PIN"]).strip():
         raise SystemExit("Set STAFF_PIN and ADMIN_PIN before starting EventPass.")
     init_db(app.config["DB_PATH"])
     port = int(os.environ.get("PORT", "5000"))
