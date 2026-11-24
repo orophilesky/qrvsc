@@ -36,10 +36,10 @@ except Exception:  # pragma: no cover - fallback for environments without psycop
 SCANNER_PAGE = r"""<!doctype html>
 <html lang="en">
 <head>
+  <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
   <meta name="theme-color" content="#101827">
   <title>EventPass Gate Scanner</title>
-  <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
   <style>
     *{box-sizing:border-box}body{margin:0;background:#101827;color:#f8fafc;font:16px system-ui,sans-serif}
     main{max-width:620px;margin:auto;padding:18px}h1{font-size:1.55rem;margin:4px 0 16px}
@@ -47,8 +47,10 @@ SCANNER_PAGE = r"""<!doctype html>
     input,button{width:100%;padding:13px;border:1px solid #536176;border-radius:9px;font:inherit}
     input{background:#1b2638;color:#fff}button{background:#2563eb;color:#fff;border:0;font-weight:700;margin-top:12px}
     #counter{background:#1b2638;text-align:center;border-radius:10px;padding:13px;margin:16px 0;font-weight:700}
-    #reader{width:100%;border:0!important;border-radius:12px;overflow:hidden;background:#fff}
-    #reader video{object-fit:cover}#manual{display:flex;gap:8px}#manual input{min-width:0}
+    #reader{width:100%;border:0!important;border-radius:12px;overflow:hidden;background:#000;min-height:240px;position:relative}
+    #reader video{width:100%;height:100%;object-fit:cover;display:block}
+    #reader canvas{display:none}
+    #manual{display:flex;gap:8px}#manual input{min-width:0}
     #manual button{width:110px;margin:0}#status{color:#b8c5d8;margin-top:10px;font-size:.9rem}
     #overlay{display:none;position:fixed;inset:0;z-index:5;align-items:center;justify-content:center;text-align:center;padding:24px;color:#fff;font-size:clamp(2rem,10vw,4rem);font-weight:850}
     #overlay small{display:block;font-size:1.2rem;margin-top:15px;overflow-wrap:anywhere}
@@ -68,8 +70,14 @@ SCANNER_PAGE = r"""<!doctype html>
 (() => {
   const gate = document.getElementById('gate'), pin = document.getElementById('pin');
   const overlay = document.getElementById('overlay'), status = document.getElementById('status');
-  const seen = new Map(); let showing = false, scanner = null;
+  const reader = document.getElementById('reader');
+  const seen = new Map(); let showing = false;
   const color = {OK:'#15803d', USED:'#b91c1c', INVALID:'#b91c1c', ERROR:'#c2410c'};
+
+  let activeMode = null; // 'native' | 'fallback'
+  let native = {stream:null, video:null, canvas:null, ctx:null, detector:null, raf:0, detecting:false, lastDetect:0, running:false};
+  let fallback = {scanner:null, starting:false, running:false, scriptPromise:null};
+
   function tone(ok) {
     try { const audio = new (window.AudioContext || window.webkitAudioContext)();
       const oscillator = audio.createOscillator(), gain = audio.createGain();
@@ -88,11 +96,40 @@ SCANNER_PAGE = r"""<!doctype html>
       }
     } catch (_) {}
   }
+
+  function stopNative() {
+    native.running = false;
+    if (native.raf) { cancelAnimationFrame(native.raf); native.raf = 0; }
+    native.detecting = false;
+    if (native.stream) {
+      try { native.stream.getTracks().forEach(t => t.stop()); } catch (_) {}
+      native.stream = null;
+    }
+    if (native.video) {
+      try { native.video.pause(); native.video.srcObject = null; native.video.remove(); } catch (_) {}
+      native.video = null;
+    }
+  }
+  async function stopFallback() {
+    if (fallback.scanner && fallback.running) {
+      try { await fallback.scanner.stop(); } catch (_) {}
+      try { fallback.scanner.clear(); } catch (_) {}
+    }
+    fallback.running = false;
+  }
+  async function stopScanning() {
+    stopNative();
+    await stopFallback();
+  }
+
   async function scan(raw) {
-    const code = raw.trim().toUpperCase(), now = Date.now();
+    const code = String(raw || '').trim().toUpperCase(), now = Date.now();
     if (showing || !code || (seen.has(code) && now - seen.get(code) < 3000)) return;
     seen.set(code, now); showing = true;
     if (seen.size > 200) for (const [key, stamp] of seen) if (now - stamp >= 3000) seen.delete(key);
+    // stop camera/scan loop immediately on detection to save CPU/battery
+    const mode = activeMode;
+    await stopScanning();
     try {
       const response = await fetch('/api/scan', {method:'POST', headers:{'Content-Type':'application/json'},
         body:JSON.stringify({code, gate:gate.value.trim(), pin:pin.value})});
@@ -117,21 +154,146 @@ SCANNER_PAGE = r"""<!doctype html>
       status.textContent = text;
     }
     overlay.style.display = 'flex';
-    setTimeout(() => {overlay.style.display='none';showing=false;}, 2000);
+    setTimeout(async () => {
+      overlay.style.display='none'; showing=false;
+      // resume camera for next scan
+      if (mode === 'native') startNative().catch(() => startFallback());
+      else if (mode === 'fallback') startFallback().catch(() => {});
+    }, 2000);
   }
+
+  function loadHtml5Qrcode() {
+    if (window.Html5Qrcode) return Promise.resolve();
+    if (fallback.scriptPromise) return fallback.scriptPromise;
+    fallback.scriptPromise = new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = 'https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js';
+      s.async = true;
+      s.onload = () => window.Html5Qrcode ? resolve() : reject(new Error('Scanner library unavailable'));
+      s.onerror = () => reject(new Error('Scanner library unavailable'));
+      document.head.appendChild(s);
+    });
+    return fallback.scriptPromise;
+  }
+
+  async function startFallback() {
+    if (fallback.running || fallback.starting || showing) return;
+    fallback.starting = true;
+    try {
+      stopNative();
+      status.textContent = 'Loading scanner...';
+      await loadHtml5Qrcode();
+      if (!fallback.scanner) fallback.scanner = new Html5Qrcode('reader');
+      const config = { fps: 12, qrbox: {width: 250, height: 250}, aspectRatio: 1.0 };
+      await fallback.scanner.start(
+        { facingMode: { exact: 'environment' } },
+        config,
+        text => scan(text),
+        () => {}
+      ).catch(async () => {
+        await fallback.scanner.start({ facingMode: 'environment' }, config, text => scan(text), () => {});
+      });
+      fallback.running = true; activeMode = 'fallback';
+      status.textContent = 'Camera ready.';
+    } catch (e) {
+      try { await stopFallback(); } catch (_) {}
+      status.textContent = 'Camera unavailable. Use manual fallback or HTTPS.';
+    } finally {
+      fallback.starting = false;
+    }
+  }
+
+  async function startNative() {
+    if (native.running || showing) return;
+    if (!('BarcodeDetector' in window)) throw new Error('No BarcodeDetector');
+    let formats = ['qr_code'];
+    try {
+      if (BarcodeDetector.getSupportedFormats) {
+        const supported = await BarcodeDetector.getSupportedFormats();
+        if (!supported.includes('qr_code')) throw new Error('QR not supported');
+      }
+    } catch (_) { /* continue; constructor may still work */ }
+    try { native.detector = new BarcodeDetector({ formats }); } catch (e) { throw e; }
+
+    stopNative();
+    reader.innerHTML = '';
+    const video = document.createElement('video');
+    video.setAttribute('playsinline', '');
+    video.muted = true;
+    video.autoplay = true;
+    reader.appendChild(video);
+    if (!native.canvas) {
+      native.canvas = document.createElement('canvas');
+      native.ctx = native.canvas.getContext('2d', { willReadFrequently: true });
+    }
+    native.video = video;
+
+    const constraints = { video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 24, max: 30 } }, audio: false };
+    const stream = await navigator.mediaDevices.getUserMedia(constraints);
+    native.stream = stream;
+    video.srcObject = stream;
+    await video.play().catch(() => {});
+    // best-effort continuous autofocus/exposure
+    try {
+      const track = stream.getVideoTracks()[0];
+      const caps = track.getCapabilities ? track.getCapabilities() : {};
+      const adv = {};
+      if (caps.focusMode && caps.focusMode.includes('continuous')) adv.focusMode = 'continuous';
+      if (caps.exposureMode && caps.exposureMode.includes('continuous')) adv.exposureMode = 'continuous';
+      if (caps.whiteBalanceMode && caps.whiteBalanceMode.includes('continuous')) adv.whiteBalanceMode = 'continuous';
+      if (Object.keys(adv).length) await track.applyConstraints({ advanced: [adv] });
+    } catch (_) {}
+
+    native.running = true; activeMode = 'native'; native.lastDetect = 0; native.detecting = false;
+    status.textContent = 'Camera ready.';
+
+    const tick = async (ts) => {
+      if (!native.running || showing) return;
+      native.raf = requestAnimationFrame(tick);
+      if (native.detecting) return;
+      if (ts - native.lastDetect < 85) return; // ~11-12 fps
+      native.lastDetect = ts;
+      const vw = video.videoWidth, vh = video.videoHeight;
+      if (!vw || !vh) return;
+      native.detecting = true;
+      try {
+        // decode a downscaled center ROI instead of full frame
+        const roi = Math.min(vw, vh) * 0.6;
+        const sx = Math.max(0, (vw - roi) / 2), sy = Math.max(0, (vh - roi) / 2);
+        const scale = Math.min(1, 640 / roi);
+        const dw = Math.max(1, Math.round(roi * scale)), dh = Math.max(1, Math.round(roi * scale));
+        if (native.canvas.width !== dw || native.canvas.height !== dh) { native.canvas.width = dw; native.canvas.height = dh; }
+        native.ctx.drawImage(video, sx, sy, roi, roi, 0, 0, dw, dh);
+        const barcodes = await native.detector.detect(native.canvas);
+        if (barcodes && barcodes.length && native.running && !showing) {
+          const value = barcodes[0].rawValue || '';
+          if (value) scan(value);
+        }
+      } catch (_) {
+        // ignore per-frame decode errors
+      } finally {
+        native.detecting = false;
+      }
+    };
+    native.raf = requestAnimationFrame(tick);
+  }
+
+  async function startScanner() {
+    try {
+      await startNative();
+    } catch (_) {
+      await startFallback();
+    }
+  }
+
   document.getElementById('submitCode').addEventListener('click', () => {
     const input = document.getElementById('manualCode'); scan(input.value); input.value = '';
   });
   document.getElementById('manualCode').addEventListener('keydown', e => {
     if (e.key === 'Enter') {e.preventDefault();document.getElementById('submitCode').click();}
   });
-  if (window.Html5Qrcode) {
-    scanner = new Html5Qrcode('reader');
-    scanner.start({facingMode:'environment'}, {fps:10,qrbox:{width:250,height:250}},
-      text => scan(text), () => {}).then(() => status.textContent = 'Camera ready.')
-      .catch(() => status.textContent = 'Camera unavailable. Use manual fallback or HTTPS.');
-  } else status.textContent = 'Scanner library unavailable. Use manual fallback.';
   stats(); setInterval(stats, 15000);
+  startScanner();
 })();
 </script></body></html>"""
 
