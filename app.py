@@ -199,7 +199,7 @@ SCANNER_PAGE = r"""<!doctype html>
     status.textContent = `Checking ${code}...`;
     // stop camera/scan loop immediately on detection to save CPU/battery
     await stopScanning();
-    let success = false;
+    let success = false, acknowledged = false;
     try {
       const response = await fetch('/api/scan', {method:'POST', headers:{'Content-Type':'application/json'},
         body:JSON.stringify({code, gate:gate.value.trim(), pin:pin.value})});
@@ -214,10 +214,13 @@ SCANNER_PAGE = r"""<!doctype html>
       if (data.status === 'OK') {message = `ENTRY OK<small>Pass ${data.serial}</small>`;success = true;}
       else if (data.status === 'USED') message = `ALREADY USED<small>${data.used_at || ''} ? ${data.gate || 'Unknown gate'}</small>`;
       else message = 'INVALID PASS';
-      overlay.innerHTML = success ? `${message}<button type="button">OK</button>` : message;
+      overlay.innerHTML = `${message}<button type="button">OK</button>`;
+      acknowledged = true;
       overlay.style.background = color[data.status] || color.INVALID;
-      status.textContent = success ? `Checked in: ${data.serial}. Click OK to scan the next pass.` : data.status;
-      if (success) overlay.querySelector('button').addEventListener('click', () => resumeScanning(mode), {once:true});
+      status.textContent = success
+        ? `Checked in: ${data.serial}. Click OK to scan the next pass.`
+        : `${data.status}. Click OK to scan the next pass.`;
+      overlay.querySelector('button').addEventListener('click', () => resumeScanning(mode), {once:true});
       tone(success); stats().catch(() => {});
     } catch (error) {
       const text = (error && error.name === 'TypeError') ? 'NETWORK ERROR, scan again' : (error.message || 'Scan failed');
@@ -226,7 +229,7 @@ SCANNER_PAGE = r"""<!doctype html>
       status.textContent = text;
     }
     overlay.style.display = 'flex';
-    if (!success) setTimeout(() => resumeScanning(mode), 2000);
+    if (!acknowledged) setTimeout(() => resumeScanning(mode), 2000);
   }
 
   function loadHtml5Qrcode() {
