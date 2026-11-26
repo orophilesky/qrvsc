@@ -96,8 +96,9 @@ SCANNER_PAGE = r"""<!doctype html>
     #manual input{min-width:0;flex:1}
     #manual button{width:auto;min-width:132px;margin:0;flex:0 0 auto}
     #status{color:var(--text-muted);margin-top:4px;font-size:.95rem;padding:0 4px}
-    #overlay{display:none;position:fixed;inset:0;z-index:5;align-items:center;justify-content:center;text-align:center;padding:24px;color:#fff;font:800 clamp(2rem,10vw,4rem)/1.05 "Montserrat",system-ui,sans-serif;letter-spacing:-0.02em}
+    #overlay{display:none;position:fixed;inset:0;z-index:5;align-items:center;justify-content:center;flex-direction:column;gap:24px;text-align:center;padding:24px;color:#fff;font:800 clamp(2rem,10vw,4rem)/1.05 "Montserrat",system-ui,sans-serif;letter-spacing:-0.02em}
     #overlay small{display:block;font:500 1.15rem "Montserrat",system-ui,sans-serif;margin-top:16px;overflow-wrap:anywhere;letter-spacing:normal}
+    #overlay button{width:auto;min-width:140px;background:#fff;color:#0F5C70;border-color:#fff;font-size:1.1rem}
     @media (max-width:640px){
       main{padding:20px 14px 28px}
       .card{padding:16px;border-radius:16px}
@@ -177,6 +178,13 @@ SCANNER_PAGE = r"""<!doctype html>
     await stopFallback();
   }
 
+  async function resumeScanning(mode) {
+    overlay.style.display='none'; showing=false;
+    if (mode === 'native') startNative().catch(() => startFallback());
+    else if (mode === 'fallback') startFallback().catch(() => {});
+    else startScanner().catch(() => {});
+  }
+
   async function scan(raw) {
     const code = String(raw || '').trim().toUpperCase(), now = Date.now();
     if (showing || !code || (seen.has(code) && now - seen.get(code) < 3000)) return;
@@ -191,6 +199,7 @@ SCANNER_PAGE = r"""<!doctype html>
     status.textContent = `Checking ${code}...`;
     // stop camera/scan loop immediately on detection to save CPU/battery
     await stopScanning();
+    let success = false;
     try {
       const response = await fetch('/api/scan', {method:'POST', headers:{'Content-Type':'application/json'},
         body:JSON.stringify({code, gate:gate.value.trim(), pin:pin.value})});
@@ -201,12 +210,14 @@ SCANNER_PAGE = r"""<!doctype html>
         throw new Error(message);
       }
       if (!data || !data.status) throw new Error('Invalid server response');
-      let message, success = false;
+      let message;
       if (data.status === 'OK') {message = `ENTRY OK<small>Pass ${data.serial}</small>`;success = true;}
       else if (data.status === 'USED') message = `ALREADY USED<small>${data.used_at || ''} ? ${data.gate || 'Unknown gate'}</small>`;
       else message = 'INVALID PASS';
-      overlay.innerHTML = message; overlay.style.background = color[data.status] || color.INVALID;
-      status.textContent = data.status === 'OK' ? `Checked in: ${data.serial}` : data.status;
+      overlay.innerHTML = success ? `${message}<button type="button">OK</button>` : message;
+      overlay.style.background = color[data.status] || color.INVALID;
+      status.textContent = success ? `Checked in: ${data.serial}. Click OK to scan the next pass.` : data.status;
+      if (success) overlay.querySelector('button').addEventListener('click', () => resumeScanning(mode), {once:true});
       tone(success); stats().catch(() => {});
     } catch (error) {
       const text = (error && error.name === 'TypeError') ? 'NETWORK ERROR, scan again' : (error.message || 'Scan failed');
@@ -215,13 +226,7 @@ SCANNER_PAGE = r"""<!doctype html>
       status.textContent = text;
     }
     overlay.style.display = 'flex';
-    setTimeout(async () => {
-      overlay.style.display='none'; showing=false;
-      // resume camera for next scan
-      if (mode === 'native') startNative().catch(() => startFallback());
-      else if (mode === 'fallback') startFallback().catch(() => {});
-      else startScanner().catch(() => {});
-    }, 2000);
+    if (!success) setTimeout(() => resumeScanning(mode), 2000);
   }
 
   function loadHtml5Qrcode() {
